@@ -1,0 +1,346 @@
+"""
+پاک‌سازی و اعتبارسنجی امنیتی داده‌ها
+"""
+
+import re
+import html
+import base64
+from typing import Any, Optional, List, Dict, Union
+from urllib.parse import urlparse, urlunparse, quote, unquote
+from ipaddress import ip_address, ip_network, IPv4Address, IPv6Address
+from src.core.exceptions import SecurityError, ValidationError
+
+
+class InputSanitizer:
+    """پاک‌سازی ورودی‌ها و جلوگیری از حملات"""
+    
+    # الگوهای خطرناک
+    DANGEROUS_PATTERNS = [
+        r'<script.*?>.*?</script>',
+        r'javascript:',
+        r'on\w+\s*=',
+        r'data:text/html',
+        r'vbscript:',
+        r'<.*?on\w+.*?>',
+        r'<\s*iframe',
+        r'<\s*object',
+        r'<\s*embed',
+    ]
+    
+    SQL_INJECTION_PATTERNS = [
+        r'(\bSELECT\b.*\bFROM\b)',
+        r'(\bINSERT\b.*\bINTO\b)',
+        r'(\bUPDATE\b.*\bSET\b)',
+        r'(\bDELETE\b.*\bFROM\b)',
+        r'(\bDROP\b.*\bTABLE\b)',
+        r'(\bUNION\b.*\bSELECT\b)',
+        r'(\b--\b)',
+        r'(\b;\s*\b)',
+    ]
+    
+    @classmethod
+    def sanitize_string(cls, text: str, allow_html: bool = False) -> str:
+        """
+        پاک‌سازی رشته‌ها از کدهای مخرب
+        
+        Args:
+            text: رشته ورودی
+            allow_html: آیا HTML مجاز است؟
+            
+        Returns:
+            رشته پاک‌سازی شده
+        """
+        if not text or not isinstance(text, str):
+            return ""
+        
+        # حذف کاراکترهای کنترل
+        text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\r\t')
+        
+        # جلوگیری از XSS
+        if not allow_html:
+            text = html.escape(text)
+        else:
+            # پاک‌سازی HTML با الگوها
+            for pattern in cls.DANGEROUS_PATTERNS:
+                text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.DOTALL)
+        
+        # حذف SQL Injection
+        for pattern in cls.SQL_INJECTION_PATTERNS:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        
+        # محدود کردن طول
+        if len(text) > 10000:
+            text = text[:10000]
+        
+        return text.strip()
+    
+    @classmethod
+    def sanitize_url(cls, url: str) -> str:
+        """
+        پاک‌سازی URL و جلوگیری از SSRF
+        
+        Args:
+            url: آدرس اینترنتی
+            
+        Returns:
+            URL پاک‌سازی شده
+        """
+        if not url:
+            raise SecurityError("URL نمی‌تواند خالی باشد")
+        
+        try:
+            parsed = urlparse(url)
+            
+            # بررسی پروتکل
+            if parsed.scheme not in ['http', 'https', 'ws', 'wss']:
+                raise SecurityError(f"پروتکل غیرمجاز: {parsed.scheme}")
+            
+            # جلوگیری از SSRF
+            host = parsed.hostname
+            if host:
+                # بلاک کردن IPهای داخلی
+                try:
+                    ip = ip_address(host)
+                    if ip.is_private or ip.is_loopback or ip.is_multicast:
+                        raise SecurityError(f"آدرس IP داخلی غیرمجاز: {host}")
+                except ValueError:
+                    # اگر hostname باشد، بررسی نمی‌کنیم
+                    pass
+                
+                # بلاک کردن دامنه‌های خطرناک
+                dangerous_domains = ['localhost', '127.0.0.1', '0.0.0.0', '::1']
+                if host.lower() in dangerous_domains:
+                    raise SecurityError(f"دامنه غیرمجاز: {host}")
+            
+            # محدود کردن طول
+            if len(url) > 2000:
+                raise SecurityError("طول URL بیش از حد مجاز است")
+            
+            # بازسازی URL با کد کردن
+            return urlunparse((
+                parsed.scheme,
+                parsed.netloc,
+                quote(unquote(parsed.path)),
+                parsed.params,
+                parsed.query,
+                parsed.fragment
+            ))
+            
+        except Exception as e:
+            raise SecurityError(f"خطا در پاک‌سازی URL: {str(e)}")
+    
+    @classmethod
+    def validate_base64(cls, data: str) -> bool:
+        """
+        اعتبارسنجی داده Base64
+        
+        Args:
+            data: رشته Base64
+            
+        Returns:
+            True اگر معتبر باشد
+        """
+        try:
+            if not data:
+                return False
+            
+            # پاک‌سازی
+            data = data.strip()
+            
+            # بررسی کاراکترهای مجاز
+            if not re.match(r'^[A-Za-z0-9+/]*={0,2}$', data):
+                return False
+            
+            # بررسی طول
+            if len(data) > 1024 * 1024:  # 1MB
+                return False
+            
+            # تلاش برای دیکد کردن
+            base64.b64decode(data, validate=True)
+            return True
+            
+        except Exception:
+            return False
+    
+    @classmethod
+    def sanitize_headers(cls, headers: Dict[str, str]) -> Dict[str, str]:
+        """
+        پاک‌سازی هدرهای HTTP
+        
+        Args:
+            headers: دیکشنری هدرها
+            
+        Returns:
+            هدرهای پاک‌سازی شده
+        """
+        sanitized = {}
+        dangerous_headers = ['host', 'content-length', 'transfer-encoding', 'connection']
+        
+        for key, value in headers.items():
+            # حذف هدرهای خطرناک
+            if key.lower() in dangerous_headers:
+                continue
+            
+            # پاک‌سازی کلید
+            clean_key = re.sub(r'[^a-zA-Z0-9\-_]', '', key)
+            if not clean_key:
+                continue
+            
+            # پاک‌سازی مقدار
+            clean_value = cls.sanitize_string(value)
+            if clean_value:
+                sanitized[clean_key] = clean_value
+        
+        return sanitized
+    
+    @classmethod
+    def validate_ip(cls, ip: str) -> bool:
+        """
+        اعتبارسنجی آدرس IP
+        
+        Args:
+            ip: آدرس IP
+            
+        Returns:
+            True اگر معتبر باشد
+        """
+        try:
+            ip_address(ip)
+            return True
+        except ValueError:
+            return False
+    
+    @classmethod
+    def validate_port(cls, port: int) -> bool:
+        """
+        اعتبارسنجی پورت
+        
+        Args:
+            port: شماره پورت
+            
+        Returns:
+            True اگر معتبر باشد
+        """
+        return 1 <= port <= 65535
+    
+    @classmethod
+    def sanitize_path(cls, path: str) -> str:
+        """
+        پاک‌سازی مسیر فایل و جلوگیری از Path Traversal
+        
+        Args:
+            path: مسیر فایل
+            
+        Returns:
+            مسیر پاک‌سازی شده
+        """
+        if not path:
+            raise SecurityError("مسیر نمی‌تواند خالی باشد")
+        
+        # حذف کاراکترهای خطرناک
+        clean = re.sub(r'[<>:"|?*]', '', path)
+        
+        # جلوگیری از Path Traversal
+        clean = clean.replace('..', '')
+        clean = clean.replace('./', '')
+        clean = clean.replace('\\', '/')
+        
+        # اطمینان از اینکه مسیر مطلق نیست
+        if clean.startswith('/'):
+            clean = clean[1:]
+        
+        # محدود کردن طول
+        if len(clean) > 255:
+            clean = clean[:255]
+        
+        return clean
+
+
+class DataValidator:
+    """اعتبارسنجی داده‌های مختلف"""
+    
+    @classmethod
+    def validate_vmess(cls, data: Dict[str, Any]) -> bool:
+        """اعتبارسنجی کانفیگ VMESS"""
+        required_fields = ['v', 'ps', 'add', 'port', 'id', 'aid', 'net', 'type', 'host', 'path']
+        
+        for field in required_fields:
+            if field not in data:
+                return False
+        
+        # اعتبارسنجی پورت
+        try:
+            port = int(data['port'])
+            if not (1 <= port <= 65535):
+                return False
+        except (ValueError, TypeError):
+            return False
+        
+        # اعتبارسنجی آدرس
+        try:
+            ip_address(data['add'])
+        except ValueError:
+            # اگر hostname باشد، اشکالی ندارد
+            pass
+        
+        return True
+    
+    @classmethod
+    def validate_vless(cls, data: Dict[str, Any]) -> bool:
+        """اعتبارسنجی کانفیگ VLESS"""
+        required_fields = ['v', 'ps', 'add', 'port', 'id', 'net', 'type', 'host', 'path']
+        
+        for field in required_fields:
+            if field not in data:
+                return False
+        
+        # اعتبارسنجی مشابه VMESS
+        try:
+            port = int(data['port'])
+            if not (1 <= port <= 65535):
+                return False
+        except (ValueError, TypeError):
+            return False
+        
+        return True
+    
+    @classmethod
+    def validate_trojan(cls, data: Dict[str, Any]) -> bool:
+        """اعتبارسنجی کانفیگ Trojan"""
+        required_fields = ['password', 'host', 'port', 'sni', 'allowInsecure']
+        
+        for field in required_fields:
+            if field not in data:
+                return False
+        
+        try:
+            port = int(data['port'])
+            if not (1 <= port <= 65535):
+                return False
+        except (ValueError, TypeError):
+            return False
+        
+        return True
+    
+    @classmethod
+    def validate_ss(cls, data: Dict[str, Any]) -> bool:
+        """اعتبارسنجی کانفیگ Shadowsocks"""
+        required_fields = ['server', 'port', 'method', 'password']
+        
+        for field in required_fields:
+            if field not in data:
+                return False
+        
+        try:
+            port = int(data['port'])
+            if not (1 <= port <= 65535):
+                return False
+        except (ValueError, TypeError):
+            return False
+        
+        return True
+
+
+# نمونه‌های تکی
+sanitizer = InputSanitizer()
+validator = DataValidator()
